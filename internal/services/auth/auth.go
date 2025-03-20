@@ -1,22 +1,18 @@
 package auth
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
 	"SSO/internal/domain/models"
 	"SSO/internal/lib/jwt"
 	"SSO/internal/lib/logger/sl"
 	"SSO/internal/storage"
-	"SSO/internal/storage/sqlite"
-	"context"
-	"errors"
-	"fmt"
-	"golang.org/x/crypto/bcrypt"
-	"log/slog"
-	"strconv"
-	"time"
-)
 
-var (
-	ErrInvalidCredentials = errors.New("invalid credentials")
+	"golang.org/x/crypto/bcrypt"
 )
 
 type Auth struct {
@@ -27,6 +23,11 @@ type Auth struct {
 	tokenTTL    time.Duration
 }
 
+var (
+	ErrInvalidCredentials = errors.New("invalid credentials")
+)
+
+//go:generate go run github.com/vektra/mockery/v2@v2.28.2 --name=URLSaver
 type UserSaver interface {
 	SaveUser(
 		ctx context.Context,
@@ -37,57 +38,27 @@ type UserSaver interface {
 
 type UserProvider interface {
 	User(ctx context.Context, email string) (models.User, error)
-	IsAdmin(ctx context.Context, userID string) (bool, error)
+	IsAdmin(ctx context.Context, userID int64) (bool, error)
 }
 
 type AppProvider interface {
 	App(ctx context.Context, appID int) (models.App, error)
 }
 
-func New(log *slog.Logger, userSaver UserSaver, userProvider *sqlite.Storage, appProvider AppProvider, tokenTTL time.Duration) *Auth {
+func New(
+	log *slog.Logger,
+	userSaver UserSaver,
+	userProvider UserProvider,
+	appProvider AppProvider,
+	tokenTTL time.Duration,
+) *Auth {
 	return &Auth{
-		usrSaver: userSaver,
-
+		usrSaver:    userSaver,
+		usrProvider: userProvider,
 		log:         log,
 		appProvider: appProvider,
-		tokenTTL:    tokenTTL, // Время жизни возвращаемых токенов
+		tokenTTL:    tokenTTL,
 	}
-}
-
-// RegisterNewUser registers new user in the system and returns user ID.
-// If user with given username already exists, returns error.
-func (a *Auth) RegisterNewUser(ctx context.Context, email string, pass string) (int64, error) {
-	// op (operation) - имя текущей функции и пакета. Такую метку удобно
-	// добавлять в логи и в текст ошибок, чтобы легче было искать хвосты
-	// в случае поломок.
-	const op = "Auth.RegisterNewUser"
-
-	// Создаём локальный объект логгера с доп. полями, содержащими полезную инфу
-	// о текущем вызове функции
-	log := a.log.With(
-		slog.String("op", op),
-		slog.String("email", email),
-	)
-
-	log.Info("registering user")
-
-	// Генерируем хэш и соль для пароля.
-	passHash, err := bcrypt.GenerateFromPassword([]byte(pass), bcrypt.DefaultCost)
-	if err != nil {
-		log.Error("failed to generate password hash", sl.Err(err))
-
-		return 0, fmt.Errorf("%s: %w", op, err)
-	}
-
-	// Сохраняем пользователя в БД
-	id, err := a.usrSaver.SaveUser(ctx, email, passHash)
-	if err != nil {
-		log.Error("failed to save user", sl.Err(err))
-
-		return 0, fmt.Errorf("%s: %w", op, err)
-	}
-
-	return id, nil
 }
 
 // Login checks if user with given credentials exists in the system and returns access token.
@@ -97,20 +68,18 @@ func (a *Auth) RegisterNewUser(ctx context.Context, email string, pass string) (
 func (a *Auth) Login(
 	ctx context.Context,
 	email string,
-	password string, // пароль в чистом виде, аккуратней с логами!
-	appID int,       // ID приложения, в котором логинится пользователь
+	password string,
+	appID int,
 ) (string, error) {
 	const op = "Auth.Login"
 
 	log := a.log.With(
 		slog.String("op", op),
 		slog.String("username", email),
-		// password либо не логируем, либо логируем в замаскированном виде
 	)
 
 	log.Info("attempting to login user")
 
-	// Достаём пользователя из БД
 	user, err := a.usrProvider.User(ctx, email)
 	if err != nil {
 		if errors.Is(err, storage.ErrUserNotFound) {
@@ -124,14 +93,12 @@ func (a *Auth) Login(
 		return "", fmt.Errorf("%s: %w", op, err)
 	}
 
-	// Проверяем корректность полученного пароля
 	if err := bcrypt.CompareHashAndPassword(user.PassHash, []byte(password)); err != nil {
 		a.log.Info("invalid credentials", sl.Err(err))
 
 		return "", fmt.Errorf("%s: %w", op, ErrInvalidCredentials)
 	}
 
-	// Получаем информацию о приложении
 	app, err := a.appProvider.App(ctx, appID)
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", op, err)
@@ -139,7 +106,6 @@ func (a *Auth) Login(
 
 	log.Info("user logged in successfully")
 
-	// Создаём токен авторизации
 	token, err := jwt.NewToken(user, app, a.tokenTTL)
 	if err != nil {
 		a.log.Error("failed to generate token", sl.Err(err))
@@ -150,20 +116,52 @@ func (a *Auth) Login(
 	return token, nil
 }
 
+// RegisterNewUser registers new user in the system and returns user ID.
+// If user with given username already exists, returns error.
+func (a *Auth) RegisterNewUser(ctx context.Context, email string, pass string) (int64, error) {
+	const op = "Auth.RegisterNewUser"
+
+	log := a.log.With(
+		slog.String("op", op),
+		slog.String("email", email),
+	)
+
+	log.Info("registering user")
+
+	passHash, err := bcrypt.GenerateFromPassword([]byte(pass), bcrypt.DefaultCost)
+	if err != nil {
+		log.Error("failed to generate password hash", sl.Err(err))
+
+		return 0, fmt.Errorf("%s: %w", op, err)
+	}
+
+	id, err := a.usrSaver.SaveUser(ctx, email, passHash)
+	if err != nil {
+		log.Error("failed to save user", sl.Err(err))
+
+		return 0, fmt.Errorf("%s: %w", op, err)
+	}
+
+	return id, nil
+}
+
+// IsAdmin checks if user is admin.
 func (a *Auth) IsAdmin(ctx context.Context, userID int64) (bool, error) {
 	const op = "Auth.IsAdmin"
 
 	log := a.log.With(
 		slog.String("op", op),
-		slog.String("user", fmt.Sprint(userID)),
+		slog.Int64("user_id", userID),
 	)
+
 	log.Info("checking if user is admin")
 
-	userIDstr := strconv.FormatInt(userID, 10)
-	isAdmin, err := a.usrProvider.IsAdmin(ctx, userIDstr)
+	isAdmin, err := a.usrProvider.IsAdmin(ctx, userID)
 	if err != nil {
 		return false, fmt.Errorf("%s: %w", op, err)
 	}
-	log.Info("checking if user is admin", slog.Bool("isAdmin", isAdmin))
+
+	log.Info("checked if user is admin", slog.Bool("is_admin", isAdmin))
+
 	return isAdmin, nil
 }

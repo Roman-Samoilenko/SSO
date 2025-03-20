@@ -62,7 +62,6 @@ func (s *serverAPI) Login(
 
 		return nil, status.Error(codes.Internal, "failed to login")
 	}
-
 	return &ssov1.LoginResponse{Token: token}, nil
 }
 
